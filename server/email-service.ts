@@ -426,7 +426,7 @@ export async function fetchEmails(targetAddress?: string): Promise<FetchedEmail[
     return pendingRequests.get(cacheKey)!;
   }
 
-  const fetchPromise = (async () => {
+  const requestPromise = (async () => {
     try {
       // Fetch all emails once
       const allEmails = await fetchAllEmailsOnce();
@@ -449,8 +449,8 @@ export async function fetchEmails(targetAddress?: string): Promise<FetchedEmail[
     }
   })();
 
-  pendingRequests.set(cacheKey, fetchPromise);
-  return fetchPromise;
+  pendingRequests.set(cacheKey, requestPromise);
+  return requestPromise;
 }
 
 export async function deleteEmail(emailId: string): Promise<boolean> {
