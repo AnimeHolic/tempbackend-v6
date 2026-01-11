@@ -225,9 +225,10 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
   isFetching = true;
 
   fetchPromise = (async () => {
+    let conn: Imap | null = null;
     try {
-      console.log("Getting main IMAP connection for fetch...");
-      const conn = await getMainConnection();
+      console.log("Creating dedicated fetch connection...");
+      conn = await createFreshConnection();
       const emails = await doFetchAllEmails(conn);
       allEmailsCache = emails;
       allEmailsCacheTime = Date.now();
@@ -238,7 +239,10 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
     } finally {
       isFetching = false;
       fetchPromise = null;
-      // Don't close main connection - it's persistent
+      // Close the dedicated fetch connection
+      if (conn) {
+        try { conn.end(); } catch (e) {}
+      }
     }
   })();
 
@@ -252,7 +256,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
   return new Promise((resolve) => {
     const newEmails: FetchedEmail[] = [];
 
-    conn.openBox("INBOX", true, (err, box) => {
+    conn.openBox("INBOX", false, (err, box) => {
       if (err) {
         console.error("Error opening INBOX:", err);
         resolve(Array.from(globalEmailStore.values()));
@@ -266,192 +270,131 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
       }
 
       const total = box.messages.total;
-      console.log(`INBOX has ${total} messages`);
+      console.log(`INBOX has ${total} messages, fetching last 30...`);
 
-      // Search for emails from last 2 days
-      const twoDaysAgo = new Date();
-      twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
-      const dateStr = twoDaysAgo.toISOString().split('T')[0].replace(/-/g, '-');
+      // Direct sequence fetch - most reliable
+      const startSeq = Math.max(1, total - 29);
+      const range = `${startSeq}:${total}`;
+      const expectedCount = Math.min(30, total);
 
-      // Use SEARCH to find recent emails
-      conn.search([['SINCE', twoDaysAgo]], (searchErr, uids) => {
-        if (searchErr) {
-          console.error("Search error:", searchErr);
-          // Fallback: fetch last 20 by sequence
-          fetchBySequence(conn, total, newEmails, resolve);
-          return;
+      let resolved = false;
+      let messageReceived = 0;
+
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
+          finishFetch(newEmails, resolve);
         }
+      }, 15000);
 
-        if (!uids || uids.length === 0) {
-          console.log("No recent emails found, fetching by sequence");
-          fetchBySequence(conn, total, newEmails, resolve);
-          return;
-        }
+      console.log(`Fetching sequence ${range}`);
 
-        // Limit to last 30 UIDs
-        const recentUids = uids.slice(-30);
-        console.log(`Found ${uids.length} recent emails, fetching ${recentUids.length}`);
+      const fetch = conn.seq.fetch(range, {
+        bodies: ["HEADER", "TEXT"],
+        struct: true,
+      });
 
-        let resolved = false;
-        let pending = recentUids.length;
+      fetch.on("message", (msg, seqno) => {
+        messageReceived++;
+        console.log(`Message ${messageReceived} received (seq ${seqno})`);
 
-        const timeout = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            console.log(`Fetch timeout, got ${newEmails.length}/${recentUids.length}`);
-            finishFetch(newEmails, resolve);
-          }
-        }, 10000);
+        let headerBuffer = "";
+        let textBuffer = "";
+        let uid = seqno;
+        let flags: string[] = [];
 
-        const fetch = conn.fetch(recentUids, { bodies: "", struct: true });
+        msg.on("attributes", (attrs) => {
+          uid = attrs.uid || seqno;
+          flags = attrs.flags || [];
+        });
 
-        fetch.on("message", (msg, seqno) => {
+        msg.on("body", (stream, info) => {
           let buffer = "";
-          let uid = seqno;
-
-          msg.on("attributes", (attrs) => {
-            uid = attrs.uid || seqno;
+          stream.on("data", (chunk) => {
+            buffer += chunk.toString("utf8");
           });
 
-          msg.on("body", (stream) => {
-            stream.on("data", (chunk) => {
-              buffer += chunk.toString("utf8");
-            });
-
-            stream.once("end", () => {
-              parseEmail(buffer, uid, newEmails);
-              pending--;
-              if (pending <= 0 && !resolved) {
-                resolved = true;
-                clearTimeout(timeout);
-                finishFetch(newEmails, resolve);
-              }
-            });
+          stream.once("end", () => {
+            if (info.which === "HEADER") {
+              headerBuffer = buffer;
+            } else {
+              textBuffer = buffer;
+            }
           });
         });
 
-        fetch.once("error", (fetchErr) => {
-          console.error("Fetch error:", fetchErr);
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            finishFetch(newEmails, resolve);
-          }
-        });
+        msg.once("end", () => {
+          // Combine header and text for parsing
+          const fullEmail = headerBuffer + "\r\n" + textBuffer;
 
-        fetch.once("end", () => {
-          setTimeout(() => {
-            if (!resolved) {
+          simpleParser(fullEmail).then((parsed) => {
+            const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
+            const fromName = parsed.from?.value?.[0]?.name || "";
+            const toAddress: string = (Array.isArray(parsed.to)
+              ? parsed.to[0]?.value?.[0]?.address
+              : parsed.to?.value?.[0]?.address) || "";
+
+            const emailId = parsed.messageId || `uid-${uid}`;
+
+            const email: FetchedEmail = {
+              id: emailId,
+              uid: uid,
+              from: fromAddress,
+              fromName: fromName,
+              to: toAddress,
+              subject: parsed.subject || "(No subject)",
+              date: parsed.date?.toISOString() || new Date().toISOString(),
+              textContent: parsed.text || "",
+              htmlContent: parsed.html || undefined,
+              isRead: flags.includes("\\Seen"),
+              attachments: parsed.attachments?.map((att: Attachment) => ({
+                filename: att.filename || "attachment",
+                contentType: att.contentType,
+                size: att.size,
+              })),
+            };
+
+            emailDataCache.set(emailId, {
+              email,
+              rawAttachments: parsed.attachments,
+              cachedAt: Date.now(),
+            });
+
+            newEmails.push(email);
+            console.log(`Parsed email ${newEmails.length}: ${email.subject?.substring(0, 30)}...`);
+
+            if (newEmails.length >= expectedCount && !resolved) {
               resolved = true;
               clearTimeout(timeout);
               finishFetch(newEmails, resolve);
             }
-          }, 500);
+          }).catch((parseErr) => {
+            console.error("Parse error:", parseErr);
+          });
         });
       });
-    });
-  });
-}
 
-function fetchBySequence(conn: Imap, total: number, newEmails: FetchedEmail[], resolve: (emails: FetchedEmail[]) => void): void {
-  const startSeq = Math.max(1, total - 19);
-  const range = `${startSeq}:${total}`;
-  console.log(`Fetching by sequence ${range}`);
-
-  let resolved = false;
-  let pending = Math.min(20, total);
-
-  const timeout = setTimeout(() => {
-    if (!resolved) {
-      resolved = true;
-      console.log(`Seq fetch timeout, got ${newEmails.length}`);
-      finishFetch(newEmails, resolve);
-    }
-  }, 10000);
-
-  const fetch = conn.seq.fetch(range, { bodies: "", struct: true });
-
-  fetch.on("message", (msg, seqno) => {
-    let buffer = "";
-    let uid = seqno;
-
-    msg.on("attributes", (attrs) => {
-      uid = attrs.uid || seqno;
-    });
-
-    msg.on("body", (stream) => {
-      stream.on("data", (chunk) => {
-        buffer += chunk.toString("utf8");
-      });
-
-      stream.once("end", () => {
-        parseEmail(buffer, uid, newEmails);
-        pending--;
-        if (pending <= 0 && !resolved) {
+      fetch.once("error", (fetchErr) => {
+        console.error("Fetch error:", fetchErr);
+        if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
           finishFetch(newEmails, resolve);
         }
       });
+
+      fetch.once("end", () => {
+        console.log(`Fetch end event, received ${messageReceived} messages`);
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            finishFetch(newEmails, resolve);
+          }
+        }, 2000); // Wait 2s for parsing to complete
+      });
     });
-  });
-
-  fetch.once("error", () => {
-    if (!resolved) {
-      resolved = true;
-      clearTimeout(timeout);
-      finishFetch(newEmails, resolve);
-    }
-  });
-
-  fetch.once("end", () => {
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        finishFetch(newEmails, resolve);
-      }
-    }, 500);
-  });
-}
-
-function parseEmail(buffer: string, uid: number, newEmails: FetchedEmail[]): void {
-  simpleParser(buffer).then((parsed: ParsedMail) => {
-    const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
-    const fromName = parsed.from?.value?.[0]?.name || "";
-    const toAddress: string = (Array.isArray(parsed.to)
-      ? parsed.to[0]?.value?.[0]?.address
-      : parsed.to?.value?.[0]?.address) || "";
-
-    const emailId = parsed.messageId || `uid-${uid}`;
-
-    const email: FetchedEmail = {
-      id: emailId,
-      uid: uid,
-      from: fromAddress,
-      fromName: fromName,
-      to: toAddress,
-      subject: parsed.subject || "(No subject)",
-      date: parsed.date?.toISOString() || new Date().toISOString(),
-      textContent: parsed.text || "",
-      htmlContent: parsed.html || undefined,
-      isRead: false,
-      attachments: parsed.attachments?.map((att: Attachment) => ({
-        filename: att.filename || "attachment",
-        contentType: att.contentType,
-        size: att.size,
-      })),
-    };
-
-    emailDataCache.set(emailId, {
-      email,
-      rawAttachments: parsed.attachments,
-      cachedAt: Date.now(),
-    });
-
-    newEmails.push(email);
-  }).catch((err) => {
-    console.error("Parse error:", err);
   });
 }
 
