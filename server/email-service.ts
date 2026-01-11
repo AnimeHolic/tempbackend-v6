@@ -84,7 +84,7 @@ class LRUCache<K, V> {
 }
 
 // Short cache TTL for fast email updates
-const emailCache = new LRUCache<string, FetchedEmail[]>(500, 3000); // 3 seconds TTL
+const emailCache = new LRUCache<string, FetchedEmail[]>(500, 5000); // 5 seconds TTL
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
@@ -93,7 +93,7 @@ const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
 let allEmailsCacheTime = 0;
-const ALL_EMAILS_CACHE_TTL = 3000; // 3 seconds cache - very fast updates!
+const ALL_EMAILS_CACHE_TTL = 5000; // 5 seconds cache
 let isFetching = false;
 
 // Request coalescing
@@ -286,7 +286,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
           finishFetch(newEmails, resolve);
         }
-      }, 8000); // 8 second timeout
+      }, 20000); // 20 second timeout - messages arrive slowly
 
       console.log(`Fetching sequence ${range}`);
 
