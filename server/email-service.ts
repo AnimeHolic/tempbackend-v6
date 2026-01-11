@@ -88,97 +88,46 @@ const emailCache = new LRUCache<string, FetchedEmail[]>(500, 10000); // 10 secon
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
-// SINGLE SHARED IMAP CONNECTION
+// FRESH CONNECTION PER FETCH (more reliable)
 // ============================================
-let sharedConnection: Imap | null = null;
-let connectionState: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
-let connectionPromise: Promise<Imap> | null = null;
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
 let allEmailsCacheTime = 0;
-const ALL_EMAILS_CACHE_TTL = 10000; // 10 seconds for all emails cache (fast updates)
+const ALL_EMAILS_CACHE_TTL = 8000; // 8 seconds cache
+let isFetching = false;
 
 // Request coalescing
 const pendingRequests = new Map<string, Promise<FetchedEmail[]>>();
 
-async function getSharedConnection(): Promise<Imap> {
-  // If already connected, return
-  if (sharedConnection && connectionState === 'connected') {
-    return sharedConnection;
-  }
-
-  // If connecting, wait for it
-  if (connectionState === 'connecting' && connectionPromise) {
-    return connectionPromise;
-  }
-
-  // Create new connection
-  connectionState = 'connecting';
-  connectionPromise = new Promise((resolve, reject) => {
-    console.log("Creating shared IMAP connection...");
+// Create a fresh connection for each fetch operation
+function createFreshConnection(): Promise<Imap> {
+  return new Promise((resolve, reject) => {
     const conn = new Imap(imapConfig);
 
     const timeout = setTimeout(() => {
-      connectionState = 'error';
       try { conn.end(); } catch (e) {}
       reject(new Error("Connection timeout"));
-    }, 30000);
+    }, 20000);
 
     conn.once("ready", () => {
       clearTimeout(timeout);
-      console.log("Shared IMAP connection established");
-      sharedConnection = conn;
-      connectionState = 'connected';
-
-      // Open inbox and keep it open
-      conn.openBox("INBOX", false, (err) => {
-        if (err) {
-          console.error("Error opening INBOX:", err);
-          connectionState = 'error';
-          reject(err);
-          return;
-        }
-        resolve(conn);
-      });
+      resolve(conn);
     });
 
     conn.once("error", (err: Error) => {
       clearTimeout(timeout);
-      console.error("Shared IMAP connection error:", err.message);
-      connectionState = 'error';
-      sharedConnection = null;
       reject(err);
-    });
-
-    conn.once("end", () => {
-      console.log("Shared IMAP connection ended");
-      connectionState = 'disconnected';
-      sharedConnection = null;
-      connectionPromise = null;
-    });
-
-    conn.once("close", () => {
-      console.log("Shared IMAP connection closed");
-      connectionState = 'disconnected';
-      sharedConnection = null;
-      connectionPromise = null;
-      // Reconnect after delay
-      setTimeout(() => {
-        if (connectionState === 'disconnected') {
-          getSharedConnection().catch(() => {});
-        }
-      }, 5000);
     });
 
     conn.connect();
   });
-
-  return connectionPromise;
 }
 
 // ============================================
 // FETCH ALL EMAILS ONCE, FILTER IN MEMORY
 // ============================================
+let fetchPromise: Promise<FetchedEmail[]> | null = null;
+
 async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
   const now = Date.now();
 
@@ -188,25 +137,43 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
     return allEmailsCache;
   }
 
-  // Rate limit: minimum 2 seconds between fetches (allows fast updates)
-  if (now - lastFetchTime < 2000) {
+  // If already fetching, wait for that fetch
+  if (isFetching && fetchPromise) {
+    console.log("Waiting for in-progress fetch");
+    return fetchPromise;
+  }
+
+  // Rate limit: minimum 3 seconds between fetches
+  if (now - lastFetchTime < 3000) {
     console.log("Rate limiting fetch, using cache");
-    return allEmailsCache;
+    return allEmailsCache.length > 0 ? allEmailsCache : Array.from(globalEmailStore.values());
   }
 
   lastFetchTime = now;
+  isFetching = true;
 
-  try {
-    const conn = await getSharedConnection();
-    const emails = await doFetchAllEmails(conn);
-    allEmailsCache = emails;
-    allEmailsCacheTime = Date.now();
-    return emails;
-  } catch (err) {
-    console.error("Error fetching emails:", err);
-    // Return stale cache on error
-    return allEmailsCache;
-  }
+  fetchPromise = (async () => {
+    let conn: Imap | null = null;
+    try {
+      console.log("Creating fresh IMAP connection for fetch...");
+      conn = await createFreshConnection();
+      const emails = await doFetchAllEmails(conn);
+      allEmailsCache = emails;
+      allEmailsCacheTime = Date.now();
+      return emails;
+    } catch (err) {
+      console.error("Error fetching emails:", err);
+      return allEmailsCache.length > 0 ? allEmailsCache : Array.from(globalEmailStore.values());
+    } finally {
+      isFetching = false;
+      fetchPromise = null;
+      if (conn) {
+        try { conn.end(); } catch (e) {}
+      }
+    }
+  })();
+
+  return fetchPromise;
 }
 
 // Global email store - accumulates emails over time
@@ -215,9 +182,9 @@ let globalEmailStore: Map<string, FetchedEmail> = new Map();
 function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
   return new Promise((resolve) => {
     const newEmails: FetchedEmail[] = [];
+    let messageCount = 0;
 
-    // Re-open box to refresh
-    conn.openBox("INBOX", false, (err, box) => {
+    conn.openBox("INBOX", true, (err, box) => {
       if (err) {
         console.error("Error opening INBOX for fetch:", err);
         resolve(Array.from(globalEmailStore.values()));
@@ -225,39 +192,40 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
       }
 
       if (!box || !box.messages.total) {
+        console.log("No messages in INBOX");
         resolve(Array.from(globalEmailStore.values()));
         return;
       }
 
-      // Only fetch LAST 30 emails for speed
+      // Only fetch LAST 25 emails for speed
       const total = box.messages.total;
-      const startSeq = Math.max(1, total - 29);
+      const startSeq = Math.max(1, total - 24);
       const range = `${startSeq}:${total}`;
+      const expectedCount = Math.min(25, total);
 
-      console.log(`Fetching emails ${range} (total: ${total})`);
+      console.log(`Fetching emails ${range} (expecting ${expectedCount})`);
+
+      let resolved = false;
+
+      // 12 second timeout
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} emails`);
+          newEmails.forEach(e => globalEmailStore.set(e.id, e));
+          const allEmails = Array.from(globalEmailStore.values());
+          allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+          resolve(allEmails);
+        }
+      }, 12000);
 
       const fetch = conn.seq.fetch(range, {
         bodies: "",
         struct: true,
       });
 
-      let pending = Math.min(30, total);
-      let resolved = false;
-
-      // SHORT 15 second timeout
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          console.log(`Fetch timeout after 15s, got ${newEmails.length} new emails`);
-          // Merge new emails into global store
-          newEmails.forEach(e => globalEmailStore.set(e.id, e));
-          const allEmails = Array.from(globalEmailStore.values());
-          allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-          resolve(allEmails);
-        }
-      }, 15000);
-
       fetch.on("message", (msg, seqno) => {
+        messageCount++;
         let buffer = "";
         let uid = seqno;
 
@@ -269,60 +237,58 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           stream.on("data", (chunk) => {
             buffer += chunk.toString("utf8");
           });
-        });
 
-        msg.once("end", async () => {
-          try {
-            const parsed: ParsedMail = await simpleParser(buffer);
+          stream.once("end", () => {
+            // Parse immediately when body stream ends
+            simpleParser(buffer).then((parsed: ParsedMail) => {
+              const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
+              const fromName = parsed.from?.value?.[0]?.name || "";
+              const toAddress: string = (Array.isArray(parsed.to)
+                ? parsed.to[0]?.value?.[0]?.address
+                : parsed.to?.value?.[0]?.address) || "";
 
-            const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
-            const fromName = parsed.from?.value?.[0]?.name || "";
-            const toAddress: string = (Array.isArray(parsed.to)
-              ? parsed.to[0]?.value?.[0]?.address
-              : parsed.to?.value?.[0]?.address) || "";
+              const emailId = parsed.messageId || `uid-${uid}`;
 
-            const emailId = parsed.messageId || `uid-${uid}`;
+              const email: FetchedEmail = {
+                id: emailId,
+                uid: uid,
+                from: fromAddress,
+                fromName: fromName,
+                to: toAddress,
+                subject: parsed.subject || "(No subject)",
+                date: parsed.date?.toISOString() || new Date().toISOString(),
+                textContent: parsed.text || "",
+                htmlContent: parsed.html || undefined,
+                isRead: false,
+                attachments: parsed.attachments?.map((att: Attachment) => ({
+                  filename: att.filename || "attachment",
+                  contentType: att.contentType,
+                  size: att.size,
+                })),
+              };
 
-            const email: FetchedEmail = {
-              id: emailId,
-              uid: uid,
-              from: fromAddress,
-              fromName: fromName,
-              to: toAddress,
-              subject: parsed.subject || "(No subject)",
-              date: parsed.date?.toISOString() || new Date().toISOString(),
-              textContent: parsed.text || "",
-              htmlContent: parsed.html || undefined,
-              isRead: false,
-              attachments: parsed.attachments?.map((att: Attachment) => ({
-                filename: att.filename || "attachment",
-                contentType: att.contentType,
-                size: att.size,
-              })),
-            };
+              emailDataCache.set(emailId, {
+                email,
+                rawAttachments: parsed.attachments,
+                cachedAt: Date.now(),
+              });
 
-            emailDataCache.set(emailId, {
-              email,
-              rawAttachments: parsed.attachments,
-              cachedAt: Date.now(),
+              newEmails.push(email);
+
+              // Check if we have all emails
+              if (newEmails.length >= expectedCount && !resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                newEmails.forEach(e => globalEmailStore.set(e.id, e));
+                const allEmails = Array.from(globalEmailStore.values());
+                allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+                console.log(`Fetched ${newEmails.length} emails, store: ${allEmails.length}`);
+                resolve(allEmails);
+              }
+            }).catch((parseErr) => {
+              console.error("Parse error:", parseErr);
             });
-
-            newEmails.push(email);
-          } catch (parseErr) {
-            console.error("Error parsing email:", parseErr);
-          }
-
-          pending--;
-          if (pending === 0 && !resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            // Merge new emails into global store
-            newEmails.forEach(e => globalEmailStore.set(e.id, e));
-            const allEmails = Array.from(globalEmailStore.values());
-            allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-            console.log(`Fetched ${newEmails.length} emails, total store: ${allEmails.length}`);
-            resolve(allEmails);
-          }
+          });
         });
       });
 
@@ -336,7 +302,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
       });
 
       fetch.once("end", () => {
-        // Give a small delay for pending parses to complete
+        // Give time for async parsing
         setTimeout(() => {
           if (!resolved) {
             resolved = true;
@@ -344,9 +310,10 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
             newEmails.forEach(e => globalEmailStore.set(e.id, e));
             const allEmails = Array.from(globalEmailStore.values());
             allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+            console.log(`Fetch end, got ${newEmails.length} emails`);
             resolve(allEmails);
           }
-        }, 500);
+        }, 1000);
       });
     });
   });
@@ -400,13 +367,15 @@ export async function fetchEmails(targetAddress?: string): Promise<FetchedEmail[
 
 export async function deleteEmail(emailId: string): Promise<boolean> {
   const cachedData = emailDataCache.get(emailId);
+  let conn: Imap | null = null;
 
   try {
-    const conn = await getSharedConnection();
+    conn = await createFreshConnection();
 
     return new Promise<boolean>((resolve) => {
-      conn.openBox("INBOX", false, (err) => {
+      conn!.openBox("INBOX", false, (err) => {
         if (err) {
+          if (conn) try { conn.end(); } catch (e) {}
           resolve(false);
           return;
         }
@@ -415,25 +384,29 @@ export async function deleteEmail(emailId: string): Promise<boolean> {
           ? [["UID", cachedData.email.uid]]
           : [["HEADER", "MESSAGE-ID", emailId]];
 
-        conn.search(searchCriteria as any, (searchErr, results) => {
+        conn!.search(searchCriteria as any, (searchErr, results) => {
           if (searchErr || !results.length) {
+            if (conn) try { conn.end(); } catch (e) {}
             resolve(false);
             return;
           }
 
-          conn.addFlags(results, "\\Deleted", (flagErr) => {
+          conn!.addFlags(results, "\\Deleted", (flagErr) => {
             if (flagErr) {
+              if (conn) try { conn.end(); } catch (e) {}
               resolve(false);
               return;
             }
 
-            conn.expunge((expErr) => {
+            conn!.expunge((expErr) => {
+              if (conn) try { conn.end(); } catch (e) {}
               if (expErr) {
                 resolve(false);
               } else {
                 // Clear caches
                 emailCache.clear();
                 emailDataCache.delete(emailId);
+                globalEmailStore.delete(emailId);
                 allEmailsCache = [];
                 allEmailsCacheTime = 0;
                 resolve(true);
@@ -445,6 +418,7 @@ export async function deleteEmail(emailId: string): Promise<boolean> {
     });
   } catch (err) {
     console.error("Delete error:", err);
+    if (conn) try { conn.end(); } catch (e) {}
     return false;
   }
 }
@@ -481,12 +455,14 @@ export async function getAttachment(emailId: string, filename: string): Promise<
   }
 
   // Fetch from IMAP if not in cache
+  let conn: Imap | null = null;
   try {
-    const conn = await getSharedConnection();
+    conn = await createFreshConnection();
 
     return new Promise<AttachmentData | null>((resolve) => {
-      conn.openBox("INBOX", false, (err) => {
+      conn!.openBox("INBOX", true, (err) => {
         if (err) {
+          if (conn) try { conn.end(); } catch (e) {}
           resolve(null);
           return;
         }
@@ -495,13 +471,14 @@ export async function getAttachment(emailId: string, filename: string): Promise<
           ? [["UID", cachedData.email.uid]]
           : [["HEADER", "MESSAGE-ID", emailId]];
 
-        conn.search(searchCriteria as any, (searchErr, results) => {
+        conn!.search(searchCriteria as any, (searchErr, results) => {
           if (searchErr || !results.length) {
+            if (conn) try { conn.end(); } catch (e) {}
             resolve(null);
             return;
           }
 
-          const fetch = conn.fetch(results, { bodies: "" });
+          const fetch = conn!.fetch(results, { bodies: "" });
 
           fetch.on("message", (msg) => {
             let buffer = "";
@@ -513,6 +490,7 @@ export async function getAttachment(emailId: string, filename: string): Promise<
             });
 
             msg.once("end", async () => {
+              if (conn) try { conn.end(); } catch (e) {}
               try {
                 const parsed = await simpleParser(buffer);
                 const attachment = parsed.attachments?.find(
@@ -536,6 +514,7 @@ export async function getAttachment(emailId: string, filename: string): Promise<
           });
 
           fetch.once("error", () => {
+            if (conn) try { conn.end(); } catch (e) {}
             resolve(null);
           });
         });
@@ -543,6 +522,7 @@ export async function getAttachment(emailId: string, filename: string): Promise<
     });
   } catch (err) {
     console.error("Attachment fetch error:", err);
+    if (conn) try { conn.end(); } catch (e) {}
     return null;
   }
 }
@@ -646,8 +626,9 @@ export function onEmailUpdate(callback: () => void): () => void {
 
 export function getQueueStats() {
   return {
-    connectionState,
+    isFetching,
     allEmailsCacheSize: allEmailsCache.length,
+    globalStoreSize: globalEmailStore.size,
     allEmailsCacheAge: Date.now() - allEmailsCacheTime,
     pendingRequests: pendingRequests.size,
   };
@@ -668,22 +649,13 @@ export function shutdown(): void {
     persistentImap = null;
   }
 
-  if (sharedConnection) {
-    try { sharedConnection.end(); } catch (e) {}
-    sharedConnection = null;
-  }
-
-  connectionState = 'disconnected';
   emailUpdateCallbacks.clear();
   pendingRequests.clear();
 
   console.log("Email service shutdown complete");
 }
 
-// Initialize connections on startup (with delay)
+// Initialize IDLE connection on startup (with delay)
 setTimeout(() => {
-  getSharedConnection().catch(err => {
-    console.error("Initial connection failed:", err);
-  });
   initPersistentConnection();
 }, 3000);
