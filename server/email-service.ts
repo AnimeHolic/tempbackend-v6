@@ -84,7 +84,7 @@ class LRUCache<K, V> {
 }
 
 // Short cache TTL for fast email updates
-const emailCache = new LRUCache<string, FetchedEmail[]>(500, 5000); // 5 seconds TTL
+const emailCache = new LRUCache<string, FetchedEmail[]>(500, 3000); // 3 seconds TTL
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
@@ -93,7 +93,7 @@ const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
 let allEmailsCacheTime = 0;
-const ALL_EMAILS_CACHE_TTL = 5000; // 5 seconds cache - fast updates!
+const ALL_EMAILS_CACHE_TTL = 3000; // 3 seconds cache - very fast updates!
 let isFetching = false;
 
 // Request coalescing
@@ -215,8 +215,8 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
     return fetchPromise;
   }
 
-  // Rate limit: minimum 2 seconds between fetches
-  if (now - lastFetchTime < 2000) {
+  // Rate limit: minimum 1 second between fetches
+  if (now - lastFetchTime < 1000) {
     console.log("Rate limiting fetch, using cache");
     return allEmailsCache.length > 0 ? allEmailsCache : Array.from(globalEmailStore.values());
   }
@@ -270,12 +270,12 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
       }
 
       const total = box.messages.total;
-      console.log(`INBOX has ${total} messages, fetching last 30...`);
+      console.log(`INBOX has ${total} messages, fetching last 15...`);
 
-      // Direct sequence fetch - most reliable
-      const startSeq = Math.max(1, total - 29);
+      // Direct sequence fetch - fetch only last 15 for speed
+      const startSeq = Math.max(1, total - 14);
       const range = `${startSeq}:${total}`;
-      const expectedCount = Math.min(30, total);
+      const expectedCount = Math.min(15, total);
 
       let resolved = false;
       let messageReceived = 0;
@@ -286,7 +286,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
           finishFetch(newEmails, resolve);
         }
-      }, 10000); // 10 second timeout
+      }, 8000); // 8 second timeout
 
       console.log(`Fetching sequence ${range}`);
 
@@ -392,21 +392,19 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
             clearTimeout(timeout);
             finishFetch(newEmails, resolve);
           }
-        }, 1000); // Wait 1s for parsing to complete
+        }, 500); // Wait 0.5s for parsing to complete
       });
     });
   });
 }
 
 function finishFetch(newEmails: FetchedEmail[], resolve: (emails: FetchedEmail[]) => void): void {
-  // Give a moment for any pending parses
-  setTimeout(() => {
-    newEmails.forEach(e => globalEmailStore.set(e.id, e));
-    const allEmails = Array.from(globalEmailStore.values());
-    allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-    console.log(`Finished: ${newEmails.length} new, ${allEmails.length} total`);
-    resolve(allEmails);
-  }, 300);
+  // Immediate finish - no delay
+  newEmails.forEach(e => globalEmailStore.set(e.id, e));
+  const allEmails = Array.from(globalEmailStore.values());
+  allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  console.log(`Finished: ${newEmails.length} new, ${allEmails.length} total`);
+  resolve(allEmails);
 }
 
 // ============================================
@@ -622,7 +620,7 @@ let persistentImap: Imap | null = null;
 let idleTimeout: NodeJS.Timeout | null = null;
 let isIdleActive = false;
 let idleNotificationTimeout: NodeJS.Timeout | null = null;
-const IDLE_DEBOUNCE_MS = 1000; // 1 second debounce (very fast response)
+const IDLE_DEBOUNCE_MS = 500; // 0.5 second debounce (instant response)
 const emailUpdateCallbacks: Set<() => void> = new Set();
 
 export function initPersistentConnection(): void {
