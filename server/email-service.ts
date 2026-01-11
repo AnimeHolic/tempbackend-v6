@@ -270,12 +270,12 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
       }
 
       const total = box.messages.total;
-      console.log(`INBOX has ${total} messages, fetching last 15...`);
+      console.log(`INBOX has ${total} messages, fetching last 5...`);
 
-      // Direct sequence fetch - fetch only last 15 for speed
-      const startSeq = Math.max(1, total - 14);
+      // Direct sequence fetch - fetch only last 5 for SPEED
+      const startSeq = Math.max(1, total - 4);
       const range = `${startSeq}:${total}`;
-      const expectedCount = Math.min(15, total);
+      const expectedCount = Math.min(5, total);
 
       let resolved = false;
       let messageReceived = 0;
@@ -286,7 +286,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
           finishFetch(newEmails, resolve);
         }
-      }, 20000); // 20 second timeout - messages arrive slowly
+      }, 8000); // 8 second timeout - only fetching 5 emails
 
       console.log(`Fetching sequence ${range}`);
 
@@ -757,14 +757,14 @@ function startBackgroundFetch(): void {
   // Fetch immediately on startup
   fetchAllEmailsOnce().catch(err => console.error("Initial fetch failed:", err));
 
-  // Then fetch every 10 seconds in background
+  // Then fetch every 5 seconds in background for fast updates
   backgroundFetchInterval = setInterval(() => {
     if (!isFetching) {
       console.log("Background fetch triggered");
       allEmailsCacheTime = 0; // Force refresh
       fetchAllEmailsOnce().catch(err => console.error("Background fetch failed:", err));
     }
-  }, 10000);
+  }, 5000);
 }
 
 // Initialize connections on startup (with delay)
