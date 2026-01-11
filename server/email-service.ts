@@ -209,129 +209,144 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
   }
 }
 
+// Global email store - accumulates emails over time
+let globalEmailStore: Map<string, FetchedEmail> = new Map();
+
 function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
   return new Promise((resolve) => {
-    const emails: FetchedEmail[] = [];
+    const newEmails: FetchedEmail[] = [];
 
     // Re-open box to refresh
     conn.openBox("INBOX", false, (err, box) => {
       if (err) {
         console.error("Error opening INBOX for fetch:", err);
-        resolve([]);
+        resolve(Array.from(globalEmailStore.values()));
         return;
       }
 
       if (!box || !box.messages.total) {
-        resolve([]);
+        resolve(Array.from(globalEmailStore.values()));
         return;
       }
 
-      // Fetch ALL emails (last 100 for performance)
-      conn.search(["ALL"], (searchErr, results) => {
-        if (searchErr || !results.length) {
-          resolve([]);
-          return;
+      // Only fetch LAST 30 emails for speed
+      const total = box.messages.total;
+      const startSeq = Math.max(1, total - 29);
+      const range = `${startSeq}:${total}`;
+
+      console.log(`Fetching emails ${range} (total: ${total})`);
+
+      const fetch = conn.seq.fetch(range, {
+        bodies: "",
+        struct: true,
+      });
+
+      let pending = Math.min(30, total);
+      let resolved = false;
+
+      // SHORT 15 second timeout
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          console.log(`Fetch timeout after 15s, got ${newEmails.length} new emails`);
+          // Merge new emails into global store
+          newEmails.forEach(e => globalEmailStore.set(e.id, e));
+          const allEmails = Array.from(globalEmailStore.values());
+          allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+          resolve(allEmails);
         }
+      }, 15000);
 
-        const recentResults = results.slice(-100);
-        const fetch = conn.fetch(recentResults, {
-          bodies: "",
-          struct: true,
+      fetch.on("message", (msg, seqno) => {
+        let buffer = "";
+        let uid = seqno;
+
+        msg.on("attributes", (attrs) => {
+          uid = attrs.uid || seqno;
         });
 
-        let pending = recentResults.length;
-        let resolved = false;
-
-        const timeout = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            console.log("Fetch timeout, returning partial results");
-            resolve(emails);
-          }
-        }, 60000); // 60 second timeout for fetch
-
-        fetch.on("message", (msg, seqno) => {
-          let buffer = "";
-          let uid = seqno;
-
-          msg.on("attributes", (attrs) => {
-            uid = attrs.uid || seqno;
+        msg.on("body", (stream) => {
+          stream.on("data", (chunk) => {
+            buffer += chunk.toString("utf8");
           });
+        });
 
-          msg.on("body", (stream) => {
-            stream.on("data", (chunk) => {
-              buffer += chunk.toString("utf8");
+        msg.once("end", async () => {
+          try {
+            const parsed: ParsedMail = await simpleParser(buffer);
+
+            const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
+            const fromName = parsed.from?.value?.[0]?.name || "";
+            const toAddress: string = (Array.isArray(parsed.to)
+              ? parsed.to[0]?.value?.[0]?.address
+              : parsed.to?.value?.[0]?.address) || "";
+
+            const emailId = parsed.messageId || `uid-${uid}`;
+
+            const email: FetchedEmail = {
+              id: emailId,
+              uid: uid,
+              from: fromAddress,
+              fromName: fromName,
+              to: toAddress,
+              subject: parsed.subject || "(No subject)",
+              date: parsed.date?.toISOString() || new Date().toISOString(),
+              textContent: parsed.text || "",
+              htmlContent: parsed.html || undefined,
+              isRead: false,
+              attachments: parsed.attachments?.map((att: Attachment) => ({
+                filename: att.filename || "attachment",
+                contentType: att.contentType,
+                size: att.size,
+              })),
+            };
+
+            emailDataCache.set(emailId, {
+              email,
+              rawAttachments: parsed.attachments,
+              cachedAt: Date.now(),
             });
-          });
 
-          msg.once("end", async () => {
-            try {
-              const parsed: ParsedMail = await simpleParser(buffer);
-
-              const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
-              const fromName = parsed.from?.value?.[0]?.name || "";
-              const toAddress: string = (Array.isArray(parsed.to)
-                ? parsed.to[0]?.value?.[0]?.address
-                : parsed.to?.value?.[0]?.address) || "";
-
-              const emailId = parsed.messageId || `uid-${uid}`;
-
-              const email: FetchedEmail = {
-                id: emailId,
-                uid: uid,
-                from: fromAddress,
-                fromName: fromName,
-                to: toAddress,
-                subject: parsed.subject || "(No subject)",
-                date: parsed.date?.toISOString() || new Date().toISOString(),
-                textContent: parsed.text || "",
-                htmlContent: parsed.html || undefined,
-                isRead: false,
-                attachments: parsed.attachments?.map((att: Attachment) => ({
-                  filename: att.filename || "attachment",
-                  contentType: att.contentType,
-                  size: att.size,
-                })),
-              };
-
-              emailDataCache.set(emailId, {
-                email,
-                rawAttachments: parsed.attachments,
-                cachedAt: Date.now(),
-              });
-
-              emails.push(email);
-            } catch (parseErr) {
-              console.error("Error parsing email:", parseErr);
-            }
-
-            pending--;
-            if (pending === 0 && !resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              emails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-              console.log(`Fetched ${emails.length} emails`);
-              resolve(emails);
-            }
-          });
-        });
-
-        fetch.once("error", (fetchErr) => {
-          console.error("Fetch error:", fetchErr);
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            resolve(emails);
+            newEmails.push(email);
+          } catch (parseErr) {
+            console.error("Error parsing email:", parseErr);
           }
-        });
 
-        fetch.once("end", () => {
+          pending--;
           if (pending === 0 && !resolved) {
             resolved = true;
             clearTimeout(timeout);
-            resolve(emails);
+            // Merge new emails into global store
+            newEmails.forEach(e => globalEmailStore.set(e.id, e));
+            const allEmails = Array.from(globalEmailStore.values());
+            allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+            console.log(`Fetched ${newEmails.length} emails, total store: ${allEmails.length}`);
+            resolve(allEmails);
           }
         });
+      });
+
+      fetch.once("error", (fetchErr) => {
+        console.error("Fetch error:", fetchErr);
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve(Array.from(globalEmailStore.values()));
+        }
+      });
+
+      fetch.once("end", () => {
+        // Give a small delay for pending parses to complete
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            newEmails.forEach(e => globalEmailStore.set(e.id, e));
+            const allEmails = Array.from(globalEmailStore.values());
+            allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+            resolve(allEmails);
+          }
+        }, 500);
       });
     });
   });
@@ -438,6 +453,7 @@ export function clearCache(): void {
   emailCache.clear();
   allEmailsCache = [];
   allEmailsCacheTime = 0;
+  // Don't clear globalEmailStore - it accumulates emails
 }
 
 interface AttachmentData {
@@ -564,13 +580,15 @@ export function initPersistentConnection(): void {
   });
 
   persistentImap.on("mail", () => {
-    console.log("New email notification via IDLE");
-    // Immediately invalidate cache so next request fetches fresh
+    console.log("New email notification via IDLE - fetching immediately");
+    // Immediately invalidate cache AND trigger fetch
     allEmailsCacheTime = 0;
+    emailCache.clear();
+    // Proactively fetch new emails right away
+    fetchAllEmailsOnce().catch(err => console.error("Proactive fetch failed:", err));
     // Debounce the notification callbacks
     if (idleNotificationTimeout) clearTimeout(idleNotificationTimeout);
     idleNotificationTimeout = setTimeout(() => {
-      clearCache();
       notifyEmailUpdate();
     }, IDLE_DEBOUNCE_MS);
   });
