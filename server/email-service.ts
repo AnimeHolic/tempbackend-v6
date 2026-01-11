@@ -88,7 +88,7 @@ const emailCache = new LRUCache<string, FetchedEmail[]>(500, 10000); // 10 secon
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
-// FRESH CONNECTION PER FETCH (more reliable)
+// SINGLE PERSISTENT CONNECTION FOR ALL OPERATIONS
 // ============================================
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
@@ -99,7 +99,79 @@ let isFetching = false;
 // Request coalescing
 const pendingRequests = new Map<string, Promise<FetchedEmail[]>>();
 
-// Create a fresh connection for each fetch operation
+// Main IMAP connection - reused for all operations
+let mainConnection: Imap | null = null;
+let mainConnectionReady = false;
+let mainConnectionPromise: Promise<Imap> | null = null;
+
+function getMainConnection(): Promise<Imap> {
+  // If already connected, return it
+  if (mainConnection && mainConnectionReady) {
+    return Promise.resolve(mainConnection);
+  }
+
+  // If connecting, wait for it
+  if (mainConnectionPromise) {
+    return mainConnectionPromise;
+  }
+
+  // Create new connection
+  mainConnectionPromise = new Promise((resolve, reject) => {
+    console.log("Creating main IMAP connection...");
+    const conn = new Imap(imapConfig);
+
+    const timeout = setTimeout(() => {
+      mainConnectionPromise = null;
+      try { conn.end(); } catch (e) {}
+      reject(new Error("Connection timeout"));
+    }, 30000);
+
+    conn.once("ready", () => {
+      clearTimeout(timeout);
+      console.log("Main IMAP connection established");
+      mainConnection = conn;
+      mainConnectionReady = true;
+      resolve(conn);
+    });
+
+    conn.once("error", (err: Error) => {
+      clearTimeout(timeout);
+      console.error("Main IMAP connection error:", err.message);
+      mainConnectionReady = false;
+      mainConnection = null;
+      mainConnectionPromise = null;
+      reject(err);
+    });
+
+    conn.once("end", () => {
+      console.log("Main IMAP connection ended");
+      mainConnectionReady = false;
+      mainConnection = null;
+      mainConnectionPromise = null;
+      // Reconnect after delay
+      setTimeout(() => {
+        getMainConnection().catch(() => {});
+      }, 5000);
+    });
+
+    conn.once("close", () => {
+      console.log("Main IMAP connection closed");
+      mainConnectionReady = false;
+      mainConnection = null;
+      mainConnectionPromise = null;
+      // Reconnect after delay
+      setTimeout(() => {
+        getMainConnection().catch(() => {});
+      }, 5000);
+    });
+
+    conn.connect();
+  });
+
+  return mainConnectionPromise;
+}
+
+// For delete/attachment operations that need write access
 function createFreshConnection(): Promise<Imap> {
   return new Promise((resolve, reject) => {
     const conn = new Imap(imapConfig);
@@ -107,7 +179,7 @@ function createFreshConnection(): Promise<Imap> {
     const timeout = setTimeout(() => {
       try { conn.end(); } catch (e) {}
       reject(new Error("Connection timeout"));
-    }, 20000);
+    }, 25000);
 
     conn.once("ready", () => {
       clearTimeout(timeout);
@@ -153,10 +225,9 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
   isFetching = true;
 
   fetchPromise = (async () => {
-    let conn: Imap | null = null;
     try {
-      console.log("Creating fresh IMAP connection for fetch...");
-      conn = await createFreshConnection();
+      console.log("Getting main IMAP connection for fetch...");
+      const conn = await getMainConnection();
       const emails = await doFetchAllEmails(conn);
       allEmailsCache = emails;
       allEmailsCacheTime = Date.now();
@@ -167,9 +238,7 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
     } finally {
       isFetching = false;
       fetchPromise = null;
-      if (conn) {
-        try { conn.end(); } catch (e) {}
-      }
+      // Don't close main connection - it's persistent
     }
   })();
 
@@ -727,13 +796,27 @@ export function shutdown(): void {
     persistentImap = null;
   }
 
+  if (mainConnection) {
+    try { mainConnection.end(); } catch (e) {}
+    mainConnection = null;
+    mainConnectionReady = false;
+  }
+
   emailUpdateCallbacks.clear();
   pendingRequests.clear();
 
   console.log("Email service shutdown complete");
 }
 
-// Initialize IDLE connection on startup (with delay)
+// Initialize connections on startup (with delay)
 setTimeout(() => {
-  initPersistentConnection();
-}, 3000);
+  // Start main connection first
+  getMainConnection().then(() => {
+    console.log("Main connection ready, starting IDLE...");
+    initPersistentConnection();
+  }).catch(err => {
+    console.error("Initial main connection failed:", err);
+    // Still try IDLE connection
+    initPersistentConnection();
+  });
+}, 2000);
