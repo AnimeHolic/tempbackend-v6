@@ -203,10 +203,15 @@ let fetchPromise: Promise<FetchedEmail[]> | null = null;
 async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
   const now = Date.now();
 
-  // Return cached if fresh
+  // Return cached if fresh OR if we have data in globalEmailStore
   if (allEmailsCache.length > 0 && (now - allEmailsCacheTime) < ALL_EMAILS_CACHE_TTL) {
-    console.log("Using all-emails cache");
+    console.log(`Using all-emails cache (${allEmailsCache.length} emails)`);
     return allEmailsCache;
+  }
+
+  // If we have emails in store but cache expired, return store data while fetching
+  if (globalEmailStore.size > 0 && !isFetching) {
+    console.log(`Cache expired, have ${globalEmailStore.size} emails in store`);
   }
 
   // If already fetching, wait for that fetch
@@ -286,7 +291,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
           finishFetch(newEmails, resolve);
         }
-      }, 8000); // 8 second timeout - only fetching 5 emails
+      }, 30000); // 30 second timeout - connection is slow to start
 
       console.log(`Fetching sequence ${range}`);
 
@@ -403,7 +408,14 @@ function finishFetch(newEmails: FetchedEmail[], resolve: (emails: FetchedEmail[]
   newEmails.forEach(e => globalEmailStore.set(e.id, e));
   const allEmails = Array.from(globalEmailStore.values());
   allEmails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  console.log(`Finished: ${newEmails.length} new, ${allEmails.length} total`);
+  console.log(`Finished: ${newEmails.length} new, ${allEmails.length} total in store`);
+
+  // Update the cache with store data
+  if (allEmails.length > 0) {
+    allEmailsCache = allEmails;
+    allEmailsCacheTime = Date.now();
+  }
+
   resolve(allEmails);
 }
 
